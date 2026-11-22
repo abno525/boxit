@@ -1,0 +1,503 @@
+#!/usr/bin/env bash
+# boxit: run a command in an Incus VM that only sees the current folder.
+#   boxit [--port SPEC].. [--reverse-port SPEC].. [CMD ARGS...]
+#                             run CMD (default: a shell) in this folder's VM, folder at /work
+#   boxit --list              list boxit VMs
+#   boxit --rm [NAME|PATH..]  delete VMs (default: this folder's); the folder's files stay
+set -euo pipefail
+
+BASE=boxit-base
+SNAP=ready
+PROFILE=boxit
+ACL=boxit-egress
+IMAGE=images:ubuntu/24.04
+BRIDGE=incusbr0
+TOKEN=${XDG_CONFIG_HOME:-$HOME/.config}/boxit/claude-oauth-token
+SSH_KEY=${XDG_CONFIG_HOME:-$HOME/.config}/boxit/ssh_key
+
+# '|| true': once the terminal is closed, writes to it fail, and set -e must not end
+# the script before it stops the VM.
+say() { printf 'boxit: %s\n' "$*" >&2 || true; }
+die() { say "$*"; exit 1; }
+
+usage() {
+	cat <<'EOF'
+usage: boxit [OPTIONS] [CMD ARGS...]  run CMD in this folder's VM (no CMD = shell), folder at /work
+       boxit --list                  list VMs created by boxit
+       boxit --rm [NAME|PATH..]      delete VM(s) (default: this folder's); folder files stay
+
+options (before CMD; --port and --reverse-port can be repeated):
+  --port SPEC          localhost:PORT on this machine -> localhost:PORT inside the VM
+  --reverse-port SPEC  localhost:PORT inside the VM -> localhost:PORT on this machine
+                       SPEC is PORT, or LISTENPORT:HOST:PORT; HOST is looked up on the far
+                       side (in the VM for --port, on this machine for --reverse-port)
+  --                   end of options, for a CMD that starts with '-'
+EOF
+}
+
+exists() { incus query "/1.0/instances/$1" >/dev/null 2>&1; }
+status() { incus query "/1.0/instances/$1" | jq -r .status; }
+
+# boxit-<folder name>-<hash of full path>, valid as an Incus instance name.
+vm_name() {
+	local base hash
+	base=$(basename "$1" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | sed 's/^-*//' | cut -c1-20 | sed 's/-*$//')
+	hash=$(printf '%s' "$1" | sha256sum | cut -c1-6)
+	echo "boxit-${base:-dir}-$hash"
+}
+
+wait_agent() {
+	local _
+	for _ in $(seq 120); do
+		incus exec "$1" -- true >/dev/null 2>&1 && return 0
+		sleep 1
+	done
+	die "VM $1 did not come up (try: incus console $1 --show-log)"
+}
+
+# The ACL's egress rules, as `incus network acl rule add` arguments. Incus applies drop
+# and reject rules before allow rules, whatever their order, and the network card rejects
+# whatever no rule allows. So the host and LAN are rejected, all IPv6 is rejected (a
+# host's and LAN's global IPv6 addresses can't be listed ahead of time), the rest of the
+# IPv4 internet is allowed, and an ACL that is empty or half made lets nothing out (fails
+# closed). "allow" is last so that a setup cut short is still closed. setup_network adds
+# any missing rule on every run, before a VM starts. Rules from older versions of this
+# list may stay in the ACL; they only reject things these rules reject anyway.
+ACL_RULES=(
+	"action=reject destination=10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16,100.64.0.0/10"
+	"action=reject destination=::/0"
+	"action=allow"
+)
+
+# has_rule ACL_JSON KEY=VALUE...: does the ACL have that rule, enabled and not narrowed?
+# A drop rule stands in for a reject rule; the order inside a list doesn't matter.
+has_rule() {
+	local acl=$1 want
+	shift
+	want=$(printf '%s\n' "$@" | jq -Rn '[inputs | capture("^(?<k>[^=]+)=(?<v>.*)$") | {(.k): .v}] | add')
+	jq -e --argjson w "$want" '
+		def norm: (. // "") | split(",") | map(gsub("^\\s+|\\s+$"; "")) | sort;
+		any(.egress[]?; . as $r | .state != "disabled"
+			and (if $w.action == "reject" then .action == "reject" or .action == "drop" else .action == $w.action end)
+			and all("source", "source_port", "destination", "destination_port", "protocol", "icmp_type", "icmp_code";
+				($r[.] | norm) == ($w[.] | norm)))' <<<"$acl" >/dev/null
+}
+
+setup_network() {
+	local acl fresh= r
+	local -a args
+	if ! acl=$(incus query "/1.0/network-acls/$ACL" 2>/dev/null); then
+		say "creating ACL $ACL (blocks the host and LAN, allows the internet)"
+		incus network acl create "$ACL"
+		acl=$(incus query "/1.0/network-acls/$ACL")
+		fresh=1
+	fi
+	for r in "${ACL_RULES[@]}"; do
+		read -ra args <<<"$r"
+		has_rule "$acl" "${args[@]}" && continue
+		[[ $fresh ]] || say "ACL $ACL is missing the rule \"$r\"; adding it"
+		incus network acl rule add "$ACL" egress "${args[@]}"
+	done
+}
+
+# Settings the profile's eth0 must have; a profile made by an older version gets them.
+# port_isolation: boxit VMs can't exchange any traffic with each other, not even below IP.
+# ipv4/ipv6_filtering: a VM can't pretend to be another instance (spoofed MAC, ARP or IP).
+NIC_SETTINGS=(
+	security.acls.default.egress.action=reject
+	security.port_isolation=true
+	security.ipv4_filtering=true
+	security.ipv6_filtering=true
+)
+
+setup_profile() {
+	local kv cur
+	if incus profile show "$PROFILE" >/dev/null 2>&1; then
+		# setup_network has already added the "allow" rule, so turning unmatched egress to
+		# reject keeps the internet working.
+		for kv in "${NIC_SETTINGS[@]}"; do
+			cur=$(incus profile device get "$PROFILE" eth0 "${kv%%=*}" 2>/dev/null) || return 0 # no eth0
+			[[ $cur == "${kv#*=}" ]] && continue
+			say "profile $PROFILE: setting $kv on eth0 (was: ${cur:-unset})"
+			incus profile device set "$PROFILE" eth0 "$kv"
+		done
+		return 0
+	fi
+	say "creating profile $PROFILE"
+	# One call, so an interrupted setup can't leave a half-made profile behind.
+	incus profile create "$PROFILE" <<EOF
+config:
+  limits.cpu: "4"
+  limits.memory: 8GiB
+devices:
+  root:
+    type: disk
+    path: /
+    pool: default
+    size: 20GiB
+  eth0:
+    type: nic
+    name: eth0
+    network: $BRIDGE
+    security.acls: $ACL
+    security.acls.default.egress.action: reject
+    security.acls.default.ingress.action: reject
+    security.port_isolation: "true"
+    security.ipv4_filtering: "true"
+    security.ipv6_filtering: "true"
+EOF
+}
+
+# The ACL keeps a VM away from other instances on the bridge only because the bridge's
+# IPv4 subnet lies inside a range it rejects. Refuse to go on if it doesn't.
+check_bridge() {
+	local net a b len
+	net=$(incus network get "$BRIDGE" ipv4.address)
+	[[ -z $net || $net == none ]] && return 0
+	if [[ $net =~ ^([0-9]+)\.([0-9]+)\.[0-9]+\.[0-9]+/([0-9]+)$ ]]; then
+		a=${BASH_REMATCH[1]} b=${BASH_REMATCH[2]} len=${BASH_REMATCH[3]}
+		((a == 10 && len >= 8)) || ((a == 172 && b >= 16 && b <= 31 && len >= 12)) ||
+			((a == 192 && b == 168 && len >= 16)) || ((a == 169 && b == 254 && len >= 16)) ||
+			((a == 100 && b >= 64 && b <= 127 && len >= 10)) && return 0
+	fi
+	die "$BRIDGE's subnet $net isn't inside a range the ACL rejects, so VMs could reach other instances on it; refusing to continue"
+}
+
+# Refuse to go on unless every network card of VM $1 uses the ACL, rejects whatever it
+# doesn't allow, and is isolated. A card without the ACL (an edited profile, or a card
+# added to that one VM) isn't filtered at all, one that lets unmatched traffic out is open
+# whenever the ACL is incomplete, and one without isolation and filtering can talk to or
+# impersonate other instances. Checks the VM's effective config: profile plus own devices.
+check_nics() {
+	local bad
+	bad=$(incus query "/1.0/instances/$1" | jq -r --arg acl "$ACL" '
+		def on: (. // "") | ascii_downcase | IN("true", "1", "yes", "on");
+		.expanded_devices | to_entries[] | select(.value.type == "nic")
+		| select(((.value["security.acls"] // "") | split(",") | map(gsub("^\\s+|\\s+$"; "")) | index($acl)) == null
+			or (.value["security.acls.default.egress.action"] | IN("reject", "drop") | not)
+			or (.value["security.port_isolation"] | on | not)
+			or (.value["security.ipv4_filtering"] | on | not))
+		| .key')
+	[[ -z $bad ]] || die "$1 has network cards that aren't locked down (${bad//$'\n'/, }): each needs security.acls=$ACL, security.acls.default.egress.action=reject, security.port_isolation=true and security.ipv4_filtering=true, or it could reach your host, LAN or other instances. Refusing to continue (see: incus config show $1 --expanded)"
+}
+
+# raw.idmap for a VM's folder share: Incus then runs virtiofsd so that agent (uid/gid 1000
+# in the VM) is you on the host, and refuses every other ID. Root in the VM can't create
+# or chown files in /work any more ("Input/output error"), so no root-owned or setuid-root
+# files or device nodes can appear in your folder. Needs virtiofs: 9p can't map IDs.
+idmap() {
+	local u g
+	u=$(id -u) g=$(id -g)
+	if [[ $u == "$g" ]]; then echo "both $u 1000"; else printf 'uid %s 1000\ngid %s 1000\n' "$u" "$g"; fi
+}
+
+# Files in the folder that aren't yours, or device nodes, can only come from a VM without
+# ID mapping. Point them out once, when the mapping is turned on for an older VM.
+warn_foreign_files() {
+	local f
+	f=$(find "$1" -xdev -mindepth 1 \( ! -user "$(id -u)" -o -type b -o -type c \) -print -quit 2>/dev/null) || true
+	[[ -z $f ]] || say "warning: this folder has files that aren't yours (e.g. $f), probably made by root in the VM; list them: find '$1' -xdev -mindepth 1 \\( ! -user $(id -u) -o -type b -o -type c \\)"
+}
+
+# Runs as root inside the base VM.
+read -r -d '' PROVISION <<'EOF' || true
+set -eu
+export DEBIAN_FRONTEND=noninteractive
+for i in $(seq 60); do getent hosts archive.ubuntu.com >/dev/null && break; sleep 1; done
+apt-get update -q
+apt-get install -y -q git curl ca-certificates build-essential python3 python3-venv unzip jq ripgrep sudo openssh-server
+# Ubuntu 24.04's default 6.8 kernel can't run programs straight from the virtiofs share
+# (exec fails with "Bad address"); its newer HWE kernel can. Clones boot it.
+apt-get install -y -q linux-generic-hwe-24.04
+apt-get clean
+
+# sshd is only for boxit's port forwards, which run it as `sshd -i` over incus exec;
+# nothing listens on port 22.
+systemctl disable --now ssh.socket ssh.service 2>/dev/null || true
+systemctl -q mask ssh.socket ssh.service
+
+# The ACL rejects all IPv6; with it off, programs don't try IPv6 first and fail.
+printf '%s\n' net.ipv6.conf.all.disable_ipv6=1 net.ipv6.conf.default.disable_ipv6=1 \
+	>/etc/sysctl.d/60-boxit-no-ipv6.conf
+
+# agent = UID/GID 1000; each VM's raw.idmap maps that to your own UID/GID on /work.
+old=$(getent passwd 1000 | cut -d: -f1 || true)
+if [ -n "$old" ] && [ "$old" != agent ]; then userdel -r "$old" 2>/dev/null || userdel "$old"; fi
+oldg=$(getent group 1000 | cut -d: -f1 || true)
+if [ -n "$oldg" ] && [ "$oldg" != agent ]; then groupdel "$oldg"; fi
+id agent >/dev/null 2>&1 || useradd -m -u 1000 -U -s /bin/bash agent
+echo 'agent ALL=(ALL) NOPASSWD:ALL' >/etc/sudoers.d/agent
+chmod 0440 /etc/sudoers.d/agent
+
+su - agent -c 'curl -fsSL https://claude.ai/install.sh | bash'
+test -x /home/agent/.local/bin/claude
+su - agent -c 'mkdir -p ~/.config/boxit && chmod 700 ~/.config/boxit'
+[ -f /home/agent/.claude.json ] || echo '{"hasCompletedOnboarding": true}' >/home/agent/.claude.json
+chown agent:agent /home/agent/.claude.json
+cat >>/home/agent/.profile <<'PROFILE'
+
+# boxit
+export PATH="$HOME/.local/bin:$PATH"
+if [ -r "$HOME/.config/boxit/claude-oauth-token" ]; then
+	CLAUDE_CODE_OAUTH_TOKEN=$(cat "$HOME/.config/boxit/claude-oauth-token")
+	export CLAUDE_CODE_OAUTH_TOKEN
+fi
+PROFILE
+
+# Every clone gets its own machine-id (and so its own DHCP lease) on first boot.
+truncate -s0 /etc/machine-id
+rm -f /var/lib/dbus/machine-id
+EOF
+
+setup_base() {
+	incus query "/1.0/instances/$BASE/snapshots/$SNAP" >/dev/null 2>&1 && return 0
+	say "building $BASE from $IMAGE (one time, a few minutes)"
+	exists "$BASE" && incus delete --force "$BASE" # leftover from a failed build
+	incus create "$IMAGE" "$BASE" --vm -p "$PROFILE"
+	check_nics "$BASE"
+	incus start "$BASE"
+	wait_agent "$BASE"
+	printf '%s\n' "$PROVISION" | incus exec "$BASE" -- bash -s \
+		|| die "provisioning failed; fix and rerun (the half-built $BASE is replaced)"
+	incus stop "$BASE"
+	incus snapshot create "$BASE" "$SNAP"
+	say "$BASE ready"
+}
+
+# For VMs built from a base older than port forwarding (runs as root inside the VM).
+read -r -d '' SSHD_SETUP <<'EOF' || true
+set -eu
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -qq && apt-get install -y -qq openssh-server >/dev/null
+systemctl disable --now ssh.socket ssh.service 2>/dev/null || true
+systemctl -q mask ssh.socket ssh.service
+EOF
+
+SSHD_OPTS="-o AuthorizedKeysFile=/etc/boxit/authorized_keys -o AllowUsers=agent \
+-o PasswordAuthentication=no -o KbdInteractiveAuthentication=no -o AllowTcpForwarding=yes \
+-o GatewayPorts=no -o PermitTTY=no -o X11Forwarding=no -o AllowAgentForwarding=no -o LogLevel=ERROR"
+
+FWD_L=() FWD_R=() FWD_MSG=() # ssh -L / -R arguments and what to tell the user, from the flags
+TUNNEL=                      # control socket of this session's ssh tunnel, if one is open
+
+valid_port() { [[ $1 =~ ^[1-9][0-9]{0,4}$ ]] && (($1 <= 65535)); }
+
+# add_forward FLAG SPEC: check SPEC (PORT, or LISTENPORT:HOST:PORT) and queue the forward.
+# The listening side is always 127.0.0.1, on this machine (--port) or in the VM.
+add_forward() {
+	local lport= host= port=
+	case $2 in
+	*:*:*) IFS=: read -r lport host port <<<"$2" ;;
+	*:*) lport= ;;
+	*) lport=$2 host=localhost port=$2 ;;
+	esac
+	valid_port "${lport:-x}" && valid_port "${port:-x}" && [[ $host =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] ||
+		die "bad $1 '$2': use PORT or LISTENPORT:HOST:PORT (ports 1-65535, HOST a name or IPv4 address)"
+	if [[ $1 == --port ]]; then
+		FWD_L+=("127.0.0.1:$lport:$host:$port")
+		FWD_MSG+=("localhost:$lport here -> $host:$port in the VM")
+	else
+		FWD_R+=("127.0.0.1:$lport:$host:$port")
+		FWD_MSG+=("localhost:$lport in the VM -> $host:$port here")
+	fi
+}
+
+# Port forwards are ssh -L/-R, carried by `incus exec` into `sshd -i` in the VM (one
+# connection, nothing listening there), so they never go through the VM's network card
+# and the ACL stays as it is. -F /dev/null keeps your own ssh config (agent forwarding and
+# such) out of it; host keys aren't checked because incus exec is already the trusted
+# channel; ExitOnForwardFailure makes -f return only once every forward is up.
+open_tunnel() {
+	local name=$1 f dir
+	local -a fwd=()
+	((${#FWD_L[@]} + ${#FWD_R[@]})) || return 0
+	if ! incus exec "$name" -- test -x /usr/sbin/sshd; then
+		say "installing openssh-server in $name for port forwarding (one time)"
+		printf '%s\n' "$SSHD_SETUP" | incus exec "$name" -- bash -s || die "could not install openssh-server in $name"
+	fi
+	if [[ ! -f $SSH_KEY ]]; then
+		mkdir -p "${SSH_KEY%/*}"
+		ssh-keygen -q -t ed25519 -N '' -C boxit -f "$SSH_KEY"
+	fi
+	incus file push -p --uid 0 --gid 0 --mode 0644 "$SSH_KEY.pub" "$name/etc/boxit/authorized_keys"
+	for f in "${FWD_L[@]}"; do fwd+=(-L "$f"); done
+	for f in "${FWD_R[@]}"; do fwd+=(-R "$f"); done
+	# A short path: a unix socket path can't be longer than about 100 characters.
+	dir=$(mktemp -d "${XDG_RUNTIME_DIR:-/tmp}/boxit.XXXXXX" 2>/dev/null || mktemp -d /tmp/boxit.XXXXXX)
+	TUNNEL=$dir/ssh
+	ssh -F /dev/null -M -S "$TUNNEL" -f -N -a -x -i "$SSH_KEY" -o IdentitiesOnly=yes \
+		-o IdentityAgent=none -o BatchMode=yes -o StrictHostKeyChecking=no \
+		-o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ExitOnForwardFailure=yes \
+		-o ProxyCommand="incus exec $name -T -- sh -c 'mkdir -p /run/sshd && exec /usr/sbin/sshd -i $SSHD_OPTS'" \
+		"${fwd[@]}" "agent@$name" 3>&- {LOCK_FD}>&- ||
+		die "could not set up the port forwards (is a port already in use?)"
+	for f in "${FWD_MSG[@]}"; do say "forwarding $f"; done
+}
+
+close_tunnel() {
+	[[ -n $TUNNEL ]] || return 0
+	ssh -S "$TUNNEL" -O exit boxit >/dev/null 2>&1 || true
+	rm -rf "${TUNNEL%/ssh}"
+	TUNNEL=
+}
+
+# Every session holds a shared lock on its VM's lock file from before it starts the VM
+# until it ends. The last one out gets the lock exclusively and stops the VM, so a VM is
+# never stopped under a session that is still starting up, and a session that begins
+# while the VM is being stopped waits, then starts it again.
+LOCK_FD=
+lock_session() {
+	local dir=${XDG_RUNTIME_DIR:-/tmp}/boxit-locks
+	[[ -n ${XDG_RUNTIME_DIR-} ]] || dir=/tmp/boxit-locks-$(id -u)
+	mkdir -p -m 700 "$dir"
+	exec {LOCK_FD}>"$dir/$1.lock"
+	flock -n -s "$LOCK_FD" && return 0
+	say "waiting for $1 to finish stopping"
+	flock -s "$LOCK_FD"
+}
+
+stop_if_idle() {
+	[[ $(status "$1") == Running ]] || return 0
+	[[ -z $LOCK_FD ]] || flock -n -x "$LOCK_FD" || return 0 # another boxit session uses it
+	pgrep -f "incus exec $1 " >/dev/null && return 0          # someone else's incus exec
+	say "stopping $1"
+	incus stop "$1" --timeout 30 2>/dev/null || incus stop "$1" --force
+}
+
+# EXIT trap of a session, however it ends: close its tunnel first (its ProxyCommand
+# counts as a session in stop_if_idle), then stop the VM if no other session uses it.
+session_end() {
+	local rc=$?
+	close_tunnel
+	stop_if_idle "$1" || true
+	exit "$rc"
+}
+
+run() {
+	local dir name path idmap kernel booted= rc=0
+	# Until the command runs, everything boxit and incus print goes to stderr (fd 3 keeps
+	# the real stdout), so stdout carries only the command's output, even on a first run.
+	exec 3>&1 >&2
+	dir=$(pwd -P)
+	[[ $dir == / || $dir == "$(cd ~ && pwd -P)" ]] && die "refusing to box / or your home folder; cd into a project folder"
+	name=$(vm_name "$dir")
+	lock_session "$name"
+
+	setup_network
+	check_bridge
+	setup_profile
+	setup_base
+
+	idmap=$(idmap)
+	if ! exists "$name"; then
+		say "creating $name for $dir"
+		# The folder and the ID mapping are set by the copy itself, so no boxit VM exists
+		# without them.
+		incus copy "$BASE/$SNAP" "$name" -c user.boxit.path="$dir" -c raw.idmap="$idmap"
+	fi
+	path=$(incus config get "$name" user.boxit.path)
+	[[ -n $path ]] || die "$name has no folder recorded (interrupted create?); remove it: boxit --rm $name"
+	[[ $path == "$dir" ]] || die "$name belongs to $path, not $dir"
+	# Checked every run, so a create cut short before the mount was added is repaired.
+	[[ $(incus config device get "$name" work source 2>/dev/null) == "$dir" ]] ||
+		incus config device add "$name" work disk source="$dir" path=/work io.bus=virtiofs >/dev/null
+	# VMs made by older versions share the folder without ID mapping. The mapping only
+	# takes effect when the VM starts, so one that is running without it must stop first.
+	if [[ $(incus config get "$name" raw.idmap) != "$idmap" || $(incus config device get "$name" work io.bus) != virtiofs ]]; then
+		[[ $(status "$name") != Running ]] ||
+			die "$name is running without ID mapping on /work (it was started by an older boxit); exit the other boxit sessions in this folder, then run boxit again"
+		say "$name: mapping IDs on /work, so root in the VM can no longer create root-owned files here"
+		incus config set "$name" raw.idmap="$idmap"
+		incus config device set "$name" work io.bus=virtiofs
+		warn_foreign_files "$dir"
+	fi
+	# Also when the VM is already running: its config may have changed since it started.
+	check_nics "$name"
+
+	# From here on, however the script ends, the tunnel is closed and the VM is stopped if
+	# this was its last session. Until the command runs, Ctrl-C and hangups end it.
+	trap "session_end $name" EXIT # expanded now: $name is local; VM names are [a-z0-9-]
+	trap 'exit 130' INT
+	trap 'exit 129' HUP
+	trap 'exit 143' TERM
+
+	if [[ $(status "$name") != Running ]]; then
+		incus start "$name" || [[ $(status "$name") == Running ]] || die "could not start $name"
+		booted=1
+	fi
+	# Also when it is already running: another session may have only just started it.
+	wait_agent "$name"
+	if [[ $booted ]]; then
+		# Same as the base's sysctl.d file, for VMs cloned from a base without it.
+		incus exec "$name" -- sysctl -q -w net.ipv6.conf.all.disable_ipv6=1 net.ipv6.conf.default.disable_ipv6=1 ||
+			say "warning: could not turn off IPv6 inside $name (it is still blocked by the ACL)"
+		kernel=$(incus exec "$name" -- uname -r) || kernel=
+		if [[ $kernel =~ ^([0-9]+)\.([0-9]+) ]] && ((BASH_REMATCH[1] < 6 || (BASH_REMATCH[1] == 6 && BASH_REMATCH[2] < 11))); then
+			say "note: $name runs kernel $kernel, which can't run programs straight from /work (\"Bad address\"; 'sh script' works)."
+			say "  fix this VM: sudo apt-get install -y linux-generic-hwe-24.04 inside it, then exit and run boxit again"
+			say "  fix new VMs: boxit --rm $BASE (the next run builds a new base with that kernel)"
+		fi
+	fi
+
+	if [[ -r $TOKEN ]]; then
+		incus file push --uid 1000 --gid 1000 --mode 0600 "$TOKEN" \
+			"$name/home/agent/.config/boxit/claude-oauth-token"
+	fi
+	open_tunnel "$name"
+
+	(($#)) || set -- bash -l
+	# Keep going after Ctrl-C / a closed terminal so the VM still gets stopped.
+	trap ':' INT HUP TERM
+	incus exec "$name" --user 1000 --group 1000 --cwd /work \
+		--env HOME=/home/agent --env USER=agent --env TERM="${TERM:-xterm-256color}" \
+		-- bash -lc 'exec "$@"' boxit "$@" >&3 || rc=$?
+	exit "$rc"
+}
+
+list() {
+	local rows
+	rows=$(incus list --format json | jq -r --arg base "$BASE" '
+		.[] | select((.name | startswith("boxit-")) and .name != $base)
+		| [.name, (.status | ascii_upcase), (.config["user.boxit.path"] // "?")] | @tsv')
+	[[ -n $rows ]] || { say "no boxit VMs"; return 0; }
+	{ printf 'NAME\tSTATE\tFOLDER\n'; printf '%s\n' "$rows"; } | column -t -s $'\t'
+}
+
+remove() {
+	local a n path ans
+	(($#)) || set -- "$(pwd -P)"
+	for a in "$@"; do
+		if [[ $a == boxit-* ]] && exists "$a"; then
+			n=$a
+		elif [[ -d $a ]]; then
+			n=$(vm_name "$(cd "$a" && pwd -P)")
+		else
+			n=$a
+		fi
+		if [[ $n != boxit-* ]] || ! exists "$n"; then say "no boxit VM for $a"; continue; fi
+		path=$(incus config get "$n" user.boxit.path)
+		read -rp "delete $n${path:+ ($path, files stay)}? [y/N] " ans
+		if [[ $ans == [yY]* ]]; then incus delete --force "$n" && say "deleted $n"; fi
+	done
+}
+
+command -v incus >/dev/null || die "incus not found"
+case "${1-}" in
+--list | -l) list; exit ;;
+--rm) shift; remove "$@"; exit ;;
+--help | -h) usage; exit ;;
+esac
+while (($#)); do
+	case $1 in
+	--port | --reverse-port)
+		(($# >= 2)) || die "$1 needs a port, e.g. $1 9090"
+		add_forward "$1" "$2"
+		shift 2
+		;;
+	--port=* | --reverse-port=*) add_forward "${1%%=*}" "${1#*=}"; shift ;;
+	--) shift; break ;;
+	-*) usage >&2; exit 2 ;;
+	*) break ;;
+	esac
+done
+run "$@"

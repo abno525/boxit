@@ -1,0 +1,140 @@
+#!/usr/bin/env bash
+# Fake incus for testing boxit. State lives as JSON under $STUB_STATE; every call is
+# logged to $STUB_STATE/log. STUB_FAIL="ruleadd:2 devadd:1" makes the 2nd rule add and
+# the 1st device add fail. STUB_EXEC_RC sets the exit code of the user's command.
+set -euo pipefail
+S=${STUB_STATE:?}
+mkdir -p "$S/inst" "$S/acl" "$S/profile"
+echo "incus $*" >>"$S/log"
+
+maybe_fail() {
+	local n
+	n=$(($(cat "$S/count.$1" 2>/dev/null || echo 0) + 1))
+	echo "$n" >"$S/count.$1"
+	if [[ " ${STUB_FAIL-} " == *" $1:$n "* ]]; then
+		echo "Error: injected failure ($1 #$n)" >&2
+		exit 1
+	fi
+}
+inst() { echo "$S/inst/$1.json"; }
+upd() { local f=$1; shift; jq "$@" "$f" >"$f.tmp" && mv "$f.tmp" "$f"; }
+acl_rules() { jq '.egress | length' "$S/acl/boxit-egress.json" 2>/dev/null || echo none; }
+notfound() { echo "Error: Not Found" >&2; exit 1; }
+
+case "$1 ${2-}" in
+"query "*)
+	p=$2
+	case $p in
+	/1.0/instances/*/snapshots/*) n=${p#/1.0/instances/}; [[ -f $S/inst/${n%%/*}.snap.${p##*/} ]] ;;
+	/1.0/instances/*)
+		f=$(inst "${p#/1.0/instances/}")
+		[[ -f $f ]] || notfound
+		# Like Incus: an instance device replaces the profile device of the same name.
+		prof=$(python3 -c 'import sys, yaml, json; print(json.dumps((yaml.safe_load(open(sys.argv[1])) or {}).get("devices") or {}))' "$S/profile/boxit.yaml" 2>/dev/null || echo '{}')
+		jq --argjson p "$prof" '.expanded_devices = ($p + .devices)' "$f"
+		;;
+	/1.0/network-acls/*) cat "$S/acl/${p##*/}.json" 2>/dev/null || notfound ;;
+	*) exit 98 ;;
+	esac
+	;;
+"network acl")
+	case $3 in
+	show) [[ -f $S/acl/$4.json ]] ;;
+	create) jq -n --arg n "$4" '{name: $n, egress: [], ingress: []}' >"$S/acl/$4.json"; echo "Network ACL $4 created" ;;
+	rule)
+		maybe_fail ruleadd
+		f=$S/acl/$5.json
+		shift 6
+		r='{"action":"","source":"","destination":"","protocol":"","source_port":"","destination_port":"","icmp_type":"","icmp_code":"","description":"","state":"enabled"}'
+		for kv; do r=$(jq --arg k "${kv%%=*}" --arg v "${kv#*=}" '.[$k] = $v' <<<"$r"); done
+		upd "$f" --argjson r "$r" '.egress += [$r]'
+		;;
+	esac
+	;;
+"network get") echo "${STUB_BRIDGE_V4-10.106.146.1/24}" ;; # only $BRIDGE ipv4.address is asked
+"profile show") [[ -f $S/profile/$3.yaml ]] ;;
+"profile create") cat >"$S/profile/$3.yaml"; echo "Profile $3 created" ;;
+"profile set") shift 3; printf '%s\n' "$@" >>"$S/profile/boxit.yaml" ;;
+"profile device")
+	case $3 in
+	get) python3 -c 'import sys, yaml
+d = (yaml.safe_load(open(sys.argv[1])) or {}).get("devices") or {}
+if sys.argv[2] not in d: sys.exit("Error: Device does not exist")
+print(d[sys.argv[2]].get(sys.argv[3], ""))' "$S/profile/$4.yaml" "$5" "$6" ;;
+	set) python3 -c 'import sys, yaml
+p, dev, kv = sys.argv[1:]
+d = yaml.safe_load(open(p)); k, v = kv.split("=", 1); d["devices"][dev][k] = v
+yaml.safe_dump(d, open(p, "w"))' "$S/profile/$4.yaml" "$5" "$6" ;;
+	*) shift 4; printf '%s\n' "$@" >>"$S/profile/boxit.yaml" ;;
+	esac
+	;;
+"create "*) jq -n '{status: "Stopped", config: {}, devices: {}}' >"$(inst "$3")"; echo "Creating $3" ;;
+"launch "*) jq -n '{status: "Running", config: {}, devices: {}}' >"$(inst "$3")" ;;
+"exec "*)
+	# The user's command runs with --user; anything else is boxit's own work as root.
+	n=$2 as_user=0
+	shift 2
+	while [[ $1 != -- ]]; do [[ $1 == --user ]] && as_user=1; shift; done
+	shift
+	[[ $1 == true ]] && exit 0
+	if [[ "$*" == "bash -s" ]]; then # provisioning or the sshd setup script, on stdin
+		if grep -q openssh-server; then touch "$S/inst/$n.sshd"; fi
+		cat >/dev/null
+		echo "Setting up openssh-server ... (apt output)"
+		exit 0
+	fi
+	if [[ "$*" == "test -x /usr/sbin/sshd" ]]; then [[ -f $S/inst/$n.sshd ]]; exit; fi
+	if [[ "$*" == "uname -r" ]]; then echo "${STUB_KERNEL:-6.14.0-36-generic}"; exit 0; fi
+	if ((as_user)); then
+		[[ -z ${STUB_EXEC_OUT-} ]] || echo "$STUB_EXEC_OUT"
+		echo "EXEC-RAN rules=$(acl_rules) work=$(jq -r '.devices.work.source // "none"' "$(inst "$n")"): $*" >>"$S/log"
+		exit "${STUB_EXEC_RC:-0}"
+	fi
+	echo "EXEC-ROOT: $*" >>"$S/log"
+	;;
+"stop "*) upd "$(inst "$2")" '.status = "Stopped"' ;;
+"snapshot create") touch "$S/inst/$3.snap.$4" ;;
+"copy "*)
+	maybe_fail copy
+	src=${2%%/*} n=$3
+	shift 3
+	if [[ -f $S/inst/$src.sshd ]]; then touch "$S/inst/$n.sshd"; fi
+	j='{"status":"Stopped","config":{},"devices":{}}'
+	while (($#)); do
+		case $1 in
+		-c) j=$(jq --arg k "${2%%=*}" --arg v "${2#*=}" '.config[$k] = $v' <<<"$j"); shift 2 ;;
+		*) shift ;;
+		esac
+	done
+	echo "$j" >"$(inst "$n")"
+	;;
+"config get") jq -r --arg k "$4" '.config[$k] // ""' "$(inst "$3")" ;;
+"config set") kv=$4; upd "$(inst "$3")" --arg k "${kv%%=*}" --arg v "${kv#*=}" '.config[$k] = $v' ;;
+"config device")
+	case $3 in
+	get) jq -er --arg d "$5" --arg k "$6" '.devices[$d][$k] // error("x")' "$(inst "$4")" 2>/dev/null ||
+		{ echo "Error: Device doesn't exist" >&2; exit 1; } ;;
+	set) # NAME DEV KEY=VALUE or NAME DEV KEY VALUE
+		f=$(inst "$4")
+		d=$5
+		shift 5
+		if [[ $1 == *=* ]]; then k=${1%%=*} v=${1#*=}; else k=$1 v=$2; fi
+		upd "$f" --arg d "$d" --arg k "$k" --arg v "$v" '.devices[$d][$k] = $v'
+		;;
+	add)
+		maybe_fail devadd
+		f=$(inst "$4")
+		d=$5
+		dev=$(jq -n --arg t "$6" '{type: $t}')
+		shift 6
+		for kv; do dev=$(jq --arg k "${kv%%=*}" --arg v "${kv#*=}" '.[$k] = $v' <<<"$dev"); done
+		upd "$f" --arg d "$d" --argjson v "$dev" '.devices[$d] = $v'
+		echo "Device $d added"
+		;;
+	esac
+	;;
+"start "*) echo "START rules=$(acl_rules)" >>"$S/log"; upd "$(inst "$2")" '.status = "Running"' ;;
+"file push") maybe_fail push ;;
+"delete --force") rm -f "$(inst "$3")" ;;
+*) echo "stub: unhandled: incus $*" >&2; exit 99 ;;
+esac

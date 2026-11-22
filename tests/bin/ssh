@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Fake ssh for testing boxit's port forwarding. Logs its arguments; "-O exit" is logged as
+# SSH-EXIT (tunnel closed); STUB_SSH_FAIL=1 fails like a forward whose port is in use.
+S=${STUB_STATE:?}
+{ printf 'SSH'; printf ' [%s]' "$@"; echo; } >>"$S/log" # each argument in brackets
+for a; do [[ $a == -O ]] && { echo SSH-EXIT >>"$S/log"; exit 0; }; done
+if [[ -n ${STUB_SSH_FAIL-} ]]; then
+	echo "bind [127.0.0.1]:9090: Address already in use" >&2
+	echo "Could not request local forwarding." >&2
+	exit 255
+fi
+echo SSH-OPEN >>"$S/log"

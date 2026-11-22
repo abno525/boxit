@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Fake id: STUB_UID / STUB_GID replace the answers to -u / -g; anything else is the real id.
+case "${1-}" in
+-u) [[ -n ${STUB_UID-} ]] && { echo "$STUB_UID"; exit 0; } ;;
+-g) [[ -n ${STUB_GID-} ]] && { echo "$STUB_GID"; exit 0; } ;;
+esac
+PATH=${PATH#*/tests/bin:} exec id "$@"
