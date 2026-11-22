@@ -1,1 +1,3 @@
+# <img src="logo.svg" width="38" align="absmiddle"> boxit
+
 boxit runs a command in an Incus virtual machine that can only see the current folder. The folder is mounted at /work, and the VM cannot reach your host or your local network. Run boxit claude in a project folder to start Claude Code inside its own VM.
